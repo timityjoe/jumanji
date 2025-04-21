@@ -131,6 +131,13 @@ problems.
 You can install the latest release of Jumanji from PyPI:
 
 ```bash
+# Create a virtual environment and install all dependencies
+uv sync
+# Activate the virtual environment
+source .venv/bin/activate
+uv pip install tensorflow (for Tensorboard display)
+uv pip install -e .
+
 pip install -U jumanji
 ```
 
@@ -139,6 +146,24 @@ Alternatively, you can install the latest development version directly from GitH
 ```bash
 pip install git+https://github.com/instadeepai/jumanji.git
 ```
+
+```bash
+Relevant directories:
+{$JUMANJI}/jumanji/training
+{$JUMANJI}/jumanji/environments/routing/robot_warehouse
+{$JUMANJI}/jumanji/training/networks/robot_warehouse
+{$JUMANJI}/jumanji/training/configs/env/robot_warehouse.yaml
+{$JUMANJI}/jumanji/training/train.py
+
+python3 -m jumanji.training.train
+python3 -m jumanji.training.train_rware
+python3 -m jumanji.training.train_rware_a2c
+python3 -m jumanji.training.load_checkpoint
+```
+
+
+# Start Tensorboard
+tensorboard --logdir=./ --port=8080
 
 Jumanji has been tested on Python 3.10, 3.11 and 3.12.
 Note that because the installation of JAX differs depending on your hardware accelerator,
