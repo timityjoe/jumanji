@@ -135,8 +135,22 @@ You can install the latest release of Jumanji from PyPI:
 uv sync
 # Activate the virtual environment
 source .venv/bin/activate
+
+conda create -n conda311-jumanji python=3.11
+conda activate conda311-jumanji
+pip install jax==0.5.3 jaxlib==0.5.3
+
+uv pip install -r requirements/requirements.txt
+uv pip install -r requirements/requirements-dev.txt
+uv pip install -r requirements/requirements-train.txt
+
 uv pip install tensorflow (for Tensorboard display)
-uv pip install -e .
+uv pip install hydra-core
+uv pip install dm-haiku
+# uv pip install -e .
+
+
+uvx pip index versions xxx
 
 pip install -U jumanji
 ```
@@ -163,7 +177,10 @@ python3 -m jumanji.training.load_checkpoint
 
 
 # Start Tensorboard
+```bash
+cd $JUMANJI_DIR/outputs/....../a2c_robot_warehouse/
 tensorboard --logdir=./ --port=8080
+```
 
 Jumanji has been tested on Python 3.10, 3.11 and 3.12.
 Note that because the installation of JAX differs depending on your hardware accelerator,

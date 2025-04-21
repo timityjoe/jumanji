@@ -69,7 +69,9 @@ agent = "random"  # @param ['random', 'a2c']
 # agent = "a2c"
 
 
-@hydra.main(config_path="configs", config_name="config.yaml")
+# Mod by Tim: @ $JUMANJI_DIR/jumanji/training/configs/
+# @hydra.main(config_path="configs", config_name="config.yaml")
+@hydra.main(config_path="configs", config_name="config_rware.yaml")
 def train(cfg: omegaconf.DictConfig, log_compiles: bool = False) -> None:
     print("train()")
     logging.info(omegaconf.OmegaConf.to_yaml(cfg))

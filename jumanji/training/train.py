@@ -35,7 +35,7 @@ from jumanji.training.setup_train import (
 from jumanji.training.timer import Timer
 from jumanji.training.types import TrainingState
 
-# Mod by Tim:
+# Mod by Tim: @ $JUMANJI_DIR/jumanji/training/configs/
 # @hydra.main(config_path="configs", config_name="config.yaml")
 @hydra.main(config_path="configs", config_name="config_rware.yaml")
 def train(cfg: omegaconf.DictConfig, log_compiles: bool = False) -> None:
