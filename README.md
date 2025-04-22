@@ -176,6 +176,10 @@ python3 -m jumanji.training.train
 python3 -m jumanji.training.train_rware
 python3 -m jumanji.training.train_tarware
 python3 -m jumanji.training.load_checkpoint
+
+Test the Environment
+python3 -m jumanji.environments.routing.robot_warehouse.env_test
+python3 -m jumanji.environments.routing.tarware.env_test
 ```
 
 

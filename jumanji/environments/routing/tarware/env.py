@@ -1,770 +1,537 @@
-import random
-from typing import Dict, List, Optional, Tuple
+# Copyright 2022 InstaDeep Ltd. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-import gymnasium as gym
-import networkx as nx
-import numpy as np
-import pyastar2d
-from gymnasium import spaces
-from jumanji.environments.routing.tarware.definitions import (Action, AgentType, Direction,
-                                 RewardType, CollisionLayers)
-from jumanji.environments.routing.tarware.spaces import observation_map
-from jumanji.environments.routing.tarware.utils import find_sections, get_next_micro_action
+import functools
+from functools import cached_property
+from typing import List, Optional, Sequence, Tuple
 
-_FIXING_CLASH_TIME = 4
-_STUCK_THRESHOLD = 5
+import chex
+import jax
+import jax.numpy as jnp
+import matplotlib
+from numpy.typing import NDArray
 
-class Entity:
-    def __init__(self, id_: int, x: int, y: int):
-        self.id = id_
-        self.prev_x = None
-        self.prev_y = None
-        self.x = x
-        self.y = y
+from jumanji import specs
+from jumanji.env import Environment
+from jumanji.environments.routing.tarware import utils
 
-class Agent(Entity):
-    counter = 0
+# from jumanji.environments.routing.tarware.warehouse import _SHELVES
 
-    def __init__(self, x: int, y: int, dir_: Direction, agent_type: AgentType):
-        Agent.counter += 1
-        super().__init__(Agent.counter, x, y)
-        self.dir = dir_
-        self.req_action: Optional[Action] = None
-        self.carrying_shelf: Optional[Shelf] = None
-        self.canceled_action = None
-        self.has_delivered = False
-        self.path = None
-        self.busy = False
-        self.fixing_clash = 0
-        self.type = agent_type
-        self.target = 0
+# from jumanji.environments.routing.tarware.generator import (
+#     Generator,
+#     RandomGenerator,
+# )
+# from jumanji.environments.routing.tarware.types import (
+#     Action,
+#     Agent,
+#     Direction,
+#     Observation,
+#     Shelf,
+#     State,
+# )
+# from jumanji.environments.routing.tarware.utils_agent import (
+#     set_new_direction_after_turn,
+#     set_new_position_after_forward,
+# )
+# from jumanji.environments.routing.tarware.utils_shelf import update_shelf
+# from jumanji.environments.routing.tarware.viewer import RobotWarehouseViewer
+# from jumanji.tree_utils import tree_slice
+# from jumanji.types import TimeStep, restart, termination, transition
+# from jumanji.viewer import Viewer
 
-    def req_location(self, grid_size) -> Tuple[int, int]:
-        if self.req_action != Action.FORWARD:
-            return self.x, self.y
-        elif self.dir == Direction.UP:
-            return self.x, max(0, self.y - 1)
-        elif self.dir == Direction.DOWN:
-            return self.x, min(grid_size[0] - 1, self.y + 1)
-        elif self.dir == Direction.LEFT:
-            return max(0, self.x - 1), self.y
-        elif self.dir == Direction.RIGHT:
-            return min(grid_size[1] - 1, self.x + 1), self.y
 
-        raise ValueError(
-            f"Direction is {self.dir}. Should be one of {[v for v in Direction]}"
-        )
-
-    def req_direction(self) -> Direction:
-        wraplist = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
-        if self.req_action == Action.RIGHT:
-            return wraplist[(wraplist.index(self.dir) + 1) % len(wraplist)]
-        elif self.req_action == Action.LEFT:
-            return wraplist[(wraplist.index(self.dir) - 1) % len(wraplist)]
-        else:
-            return self.dir
-
-class Shelf(Entity):
-    counter = 0
-
-    def __init__(self, x, y):
-        Shelf.counter += 1
-        super().__init__(Shelf.counter, x, y)
-
-class StuckCounter:
-    def __init__(self, position: Tuple[int, int]):
-        self.position = position
-        self.count = 0
-
-    def update(self, new_position: Tuple[int, int]):
-        if new_position == self.position:
-            self.count += 1
-        else:
-            self.count = 0
-            self.position = new_position
-
-    def reset(self, position=None):
-        self.count = 0
-        if position:
-            self.position = position
-
-# Mod by Tim:
-# class Warehouse(gym.Env):
 class TaskAwareRobotWarehouse(Environment[State, specs.MultiDiscreteArray, Observation]):
+    """A JAX implementation of the 'Robotic warehouse' environment:
+    https://github.com/semitable/robotic-warehouse
+    which is described in the paper [1].
 
-    metadata = {"render_modes": ["human", "rgb_array"]}
+    Creates a grid world where multiple agents (robots)
+    are supposed to collect shelves, bring them to a goal
+    and then return them.
+
+    Below is an example warehouse floor grid:
+    the grid layout is instantiated using three arguments
+
+    - shelf_rows: number of vertical shelf clusters
+    - shelf_columns: odd number of horizontal shelf clusters
+    - column_height: height of each cluster
+
+    A cluster is a set of grouped shelves (two cells wide) represented
+    below as
+
+                        XX
+    Shelf cluster ->    XX    (this cluster is of height 3)
+                        XX
+
+    Grid Layout:
+
+                   shelf columns (here set to 3, i.e.
+                     v  v  v      shelf_columns=3, must be an odd number)
+                    ----------
+                 >  -XX-XX-XX-        ^
+    Shelf Row 1 ->  -XX-XX-XX-  Column Height (here set to 3, i.e.
+                 >  -XX-XX-XX-        v        column_height=3)
+                    ----------
+                    -XX----XX-   <
+                    -XX----XX-   <- Shelf Row 2 (here set to 2, i.e.
+                    -XX----XX-   <              shelf_rows=2)
+                    ----------
+                    ----GG----
+
+    - G: is the goal positions where agents are rewarded if
+    they successfully deliver a requested shelf (i.e toggle the load action
+    inside the goal position while carrying a requested shelf).
+
+    The final grid size will be
+    - height: (column_height + 1) * shelf_rows + 2
+    - width: (2 + 1) * shelf_columns + 1
+
+    The bottom-middle column is removed to allow for
+    agents to queue in front of the goal positions
+
+    - action: jax array (int) of shape (num_agents,) containing the action for each agent.
+        (0: noop, 1: forward, 2: left, 3: right, 4: toggle_load)
+
+    - reward: jax array (int) of shape (), global reward shared by all agents, +1
+        for every successful delivery of a requested shelf to the goal position.
+
+    - episode termination:
+        - The number of steps is greater than the limit.
+        - Any agent selects an action which causes two agents to collide.
+
+    - state: State
+        - grid: an array representing the warehouse floor as a 2D grid with two separate channels
+            one for the agents, and one for the shelves
+        - agents: a pytree of Agent type with per agent leaves: [position, direction, is_carrying]
+        - shelves: a pytree of Shelf type with per shelf leaves: [position, is_requested]
+        - request_queue: the queue of requested shelves (by ID).
+        - step_count: an integer representing the current step of the episode.
+        - action_mask: an array of shape (num_agents, 5) containing the valid actions
+            for each agent.
+        - key: a pseudorandom number generator key.
+
+    [1] Papoudakis et al., Benchmarking Multi-Agent Deep Reinforcement Learning Algorithms
+        in Cooperative Tasks (2021)
+
+    ```python
+    from jumanji.environments import RobotWarehouse
+    env = RobotWarehouse()
+    key = jax.random.PRNGKey(0)
+    state, timestep = jax.jit(env.reset)(key)
+    env.render(state)
+    action = env.action_spec.generate_value()
+    state, timestep = jax.jit(env.step)(state, action)
+    env.render(state)
+    ```
+    """
 
     def __init__(
         self,
-        shelf_columns: int,
-        column_height: int,
-        shelf_rows: int,
-        num_agvs: int,
-        num_pickers: int,
-        request_queue_size: int,
-        max_inactivity_steps: Optional[int],
-        max_steps: Optional[int],
-        reward_type: RewardType,
-        normalised_coordinates: bool=False,
-        observation_type: str = "global",
+        generator: Optional[Generator] = None,
+        time_limit: int = 500,
+        viewer: Optional[Viewer[State]] = None,
     ):
-        """The robotic warehouse environment
+        """Instantiates an `RobotWarehouse` environment.
 
-        Creates a grid world where multiple agents (robots)
-        are supposed to collect shelfs, bring them to a goal
-        and then return them.
-        .. note:
-            The grid looks like this:
-
-            shelf
-            columns
-                vv
-            ----------
-            -XX-XX-XX-        ^
-            -XX-XX-XX-  Column Height
-            -XX-XX-XX-        v
-            ----------
-            -XX----XX-   <\
-            -XX----XX-   <- Shelf Rows
-            -XX----XX-   </
-            ----------
-            ----GG----
-
-            G: is the goal positions where agents are rewarded if
-            they bring the correct shelfs.
-
-            The final grid size will be
-            height: (column_height + 1) * shelf_rows + 2
-            width: (2 + 1) * shelf_columns + 1
-
-            The bottom-middle column will be removed to allow for
-            robot queuing next to the goal locations
-
-        :param shelf_columns: Number of columns in the warehouse
-        :type shelf_columns: int
-        :param column_height: Column height in the warehouse
-        :type column_height: int
-        :param shelf_rows: Number of columns in the warehouse
-        :type shelf_rows: int
-        :param num_agvs: Number of spawned and controlled agv
-        :type num_agvs: int
-        :param num_pickers: Number of spawned and controlled pickers
-        :type num_pickers: int
-        :param request_queue_size: How many shelfs are simultaneously requested
-        :type request_queue_size: int
-        :param max_inactivity: Number of steps without a delivered shelf until environment finishes
-        :type max_inactivity: Optional[int]
-        :param reward_type: Specifies if agents are rewarded individually or globally
-        :type reward_type: RewardType
-        :param observation_type: Specifies type of observations
-        :type normalised_coordinates: str
-        :param normalised_coordinates: Specifies whether absolute coordinates should be normalised
-            with respect to total warehouse size
-        :type normalised_coordinates: bool
+        Args:
+            generator: callable to instantiate environment instances.
+                Defaults to `RandomGenerator` with parameters:
+                `shelf_rows = 2`,
+                `shelf_columns = 3`,
+                `column_height = 8`,
+                `num_agents = 4`,
+                `sensor_range = 1`,
+                `request_queue_size = 8`.
+            time_limit: the maximum step limit allowed within the environment.
+                Defaults to 500.
+            viewer: viewer to render the environment. Defaults to `RobotWarehouseViewer`.
         """
+
+        # default generator is: tarware-tiny-4ag-easy (in original implementation)
+        self._generator = generator or RandomGenerator(
+            column_height=8,
+            shelf_rows=2,
+            shelf_columns=3,
+            num_agents=4,
+            sensor_range=1,
+            request_queue_size=8,
+        )
 
         self.goals: List[Tuple[int, int]] = []
+        self.grid_size = self._generator.grid_size
+        self.request_queue_size = self._generator.request_queue_size
 
-        self.num_agvs = num_agvs
-        self.num_pickers = num_pickers
-        self.num_agents = num_agvs + num_pickers
+        self.num_agents = self._generator.num_agents
+        self.sensor_range = self._generator.sensor_range
+        self.highways = self._generator.highways
+        self.shelf_ids = self._generator.shelf_ids
+        self.not_in_queue_size = self._generator.not_in_queue_size
 
-        self._make_layout_from_params(shelf_columns, shelf_rows, column_height)
-        # If no Pickers are generated, AGVs can perform picks independently
-        if num_pickers > 0:
-            self._agent_types = [AgentType.AGV for _ in range(num_agvs)] + [AgentType.PICKER for _ in range(num_pickers)]
-        else:
-            self._agent_types = [AgentType.AGENT for _ in range(self.num_agents)]
+        self.agent_ids = jnp.arange(self.num_agents)
+        self.directions = jnp.array([d.value for d in Direction])
+        self.num_obs_features = utils.calculate_num_observation_features(self.sensor_range)
+        self.goals = self._generator.goals
+        self.time_limit = time_limit
+        super().__init__()
 
-        self.max_inactivity_steps: Optional[int] = max_inactivity_steps
-        self.reward_type = reward_type
-        self._cur_inactive_steps = None
-        self._cur_steps = 0
-        self.max_steps = max_steps
+        # create viewer for rendering environment
+        self._viewer = viewer or RobotWarehouseViewer(self.grid_size, self.goals, "RobotWarehouse")
 
-        self.action_size = len(self.action_id_to_coords_map) + 1
-        self.action_space = spaces.Tuple(tuple(self.num_agents * [spaces.Discrete(self.action_size)]))
-
-        self.observation_space_mapper = observation_map[observation_type](
-            self.num_agvs,
-            self.num_pickers,
-            self.grid_size,
-            len(self.action_id_to_coords_map)-len(self.goals),
-            normalised_coordinates,
+    def __repr__(self) -> str:
+        return (
+            f"RobotWarehouse(\n"
+            f"\tgrid_width={self.grid_size[1]!r},\n"
+            f"\tgrid_height={self.grid_size[0]!r},\n"
+            f"\tnum_agents={self.num_agents!r}, \n"
+            ")"
         )
-        self.observation_space = spaces.Tuple(tuple(self.observation_space_mapper.ma_spaces))
 
-        self.request_queue_size = request_queue_size
-        self.request_queue = []
-        self.rack_groups = find_sections(list([loc for loc in self.action_id_to_coords_map.values() if (loc[1], loc[0]) not in self.goals]))
-        self.agents: List[Agent] = []
-        self.stuck_counters = []
-        self.renderer = None
+    def reset(self, key: chex.PRNGKey) -> Tuple[State, TimeStep[Observation]]:
+        """Resets the environment.
 
-    @property
-    def targets_agvs(self):
-        return [agent.target for agent in self.agents[:self.num_agvs]]
-
-    @property
-    def targets_pickers(self):
-        return [agent.target for agent in self.agents[self.num_agvs:]]
-
-    def _make_layout_from_params(self, shelf_columns: int, shelf_rows: int, column_height: int) -> None:
-        assert shelf_columns % 2 == 1, "Only odd number of shelf columns is supported"
-        self._bottom_rows = 2
-        self._highway_lanes = 2
-        self.column_width = 2
-        self.column_height = column_height
-        self.grid_size = (
-            self._highway_lanes + (self.column_height + self._highway_lanes) * shelf_rows  + self._bottom_rows + 1,
-            self._highway_lanes + (self.column_width  + self._highway_lanes) * shelf_columns,
-        )
-        self.grid = np.zeros((len(CollisionLayers), *self.grid_size), dtype=np.int32)
-
-        def get_highway_lanes_indices(axis_size, step):
-            return [
-                i + j
-                for i in range(
-                    0, axis_size, step + self._highway_lanes
-                )
-                for j in range(self._highway_lanes)
-            ]
-
-        highway_ys = get_highway_lanes_indices(self.grid_size[0], self.column_height)
-        highway_xs = get_highway_lanes_indices(self.grid_size[1], self.column_width)
-
-        def highway_func(x, y):
-            return x in highway_xs or y in highway_ys or y >= self.grid_size[0] - 1 - self._bottom_rows
-
-        self.goals = [
-            (i, self.grid_size[0] - 1)
-            for i in range(self.grid_size[1]) if not i in highway_xs
-        ]
-        self.num_goals = len(self.goals)
-
-        self.highways = np.zeros(self.grid_size, dtype=np.int32)
-        self.action_id_to_coords_map = {i+1: (x, y) for i, (y, x) in enumerate(self.goals)}
-        item_loc_index=len(self.action_id_to_coords_map)+1
-        for x in range(self.grid_size[1]):
-            for y in range(self.grid_size[0]):
-                self.highways[y, x] = highway_func(x, y)
-                if not highway_func(x, y) and (x, y) not in self.goals:
-                    self.action_id_to_coords_map[item_loc_index] = (y, x)
-                    item_loc_index+=1
-
-    def _is_highway(self, x: int, y: int) -> bool:
-        return self.highways[y, x]
-
-    def find_path(self, start, goal: Tuple[int], agent: Tuple[int], care_for_agents: bool = True) -> List[Tuple[int]]:
-        """
-        Constructs a path from start to goal using the A* algorithm contidioned on a grid that integrates both the
-        environment specific (shelf) and the presence of other agents as obstacles.
-
-        If `care_for_agents` is True, the grid is adjusted to consider other agents as obtacles. However, we avoid
-        situatiosns where the paths is invalidated by agents of other types waiting to cooperate with the current.
-        For Pickers, the grid is further modified to ensure they can only travel through designated highways and
-        access goal locations.
-
-        Parameters:
-        - care_for_agents (bool): Whether to consider other agents in the grid.
-        - agent (Agent): The agent for which the path is being calculated.
-        - start (tuple): The starting coordinates (x, y) of the agent.
-        - goal (tuple): The goal coordinates (x, y) for the agent.
+        Args:
+            key: random key used to reset the environment since it is stochastic.
 
         Returns:
-        - List of tuples representing the path from start to goal, or an empty list if no path is found.
+            state: State object corresponding to the new state of the environment.
+            timestep: TimeStep object corresponding the first timestep returned by the environment.
         """
-        grid = np.zeros(self.grid_size)
-        if care_for_agents:
-            grid += self.grid[CollisionLayers.AGVS]
-            grid += self.grid[CollisionLayers.PICKERS]
-        # Agents should start a path regardless if some others are waiting around the target location
-        grid[goal[0], goal[1]] = 0
+        # create environment state
+        state = self._generator(key)
 
-        if agent.type == AgentType.PICKER:
-            # Pickers can only travel through the highway, but can access goal locations
-            grid += (1-self.highways)
-            grid[goal[0], goal[1]] -= not self._is_highway(goal[1], goal[0])
-            for i in range(self.grid_size[1]):
-                grid[self.grid_size[0] - 1, i] = 1
-
-        # Ban Pickers crossing through racks if adjacent target location is chosen and force them thake the long way around.
-        start_fix = (0, 0)
-        if agent.type == AgentType.PICKER and  ((not self._is_highway(start[1], start[0])) and goal[0] == start[0] and abs(goal[1] - start[1]) == 1):
-            if self._is_highway(start[1] - 1, start[0]):
-                start_fix = (0, - 1)
-            if self._is_highway(start[1] + 1, start[0]):
-                start_fix = (0, 1)
-            grid[start[0], start[1]] = 1
-
-        grid[start[0]+start_fix[0], start[1]+start_fix[1]] = 0
-        grid = [list(map(int, l)) for l in (grid!=0)]
-        grid = np.array(grid, dtype=np.float32)
-        grid[np.where(grid == 1)] = np.inf
-        grid[np.where(grid == 0)] = 1
-        astar_path = pyastar2d.astar_path(grid, np.add(start, start_fix), goal, allow_diagonal=False) # returns None if cant find path
-        # astar_path = astar_path[int(np.where(astar_path == np.add(start, start_fix))[0][0]):]
-        if astar_path is not None:
-            astar_path = [tuple(x) for x in list(astar_path)] # convert back to other format
-            astar_path = astar_path[1 - int(grid[start[0], start[1]] > 1):]
-
-        if astar_path:
-            return [(x, y) for y, x in astar_path]
-        else:
-            return []
-
-    def _recalc_grid(self) -> None:
-        self.grid.fill(0)
-
-        carried_shelf_ids = {agent.carrying_shelf.id for agent in self.agents if agent.carrying_shelf}
-        for shelf in self.shelfs:
-            if shelf.id not in carried_shelf_ids:
-                self.grid[CollisionLayers.SHELVES, shelf.y, shelf.x] = shelf.id
-        for agent in self.agents:
-            layer = CollisionLayers.PICKERS if agent.type == AgentType.PICKER else CollisionLayers.AGVS
-            self.grid[layer, agent.y, agent.x] = agent.id
-            if agent.carrying_shelf:
-                 self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = agent.carrying_shelf.id
-
-    def get_carrying_shelf_information(self):
-        return [agent.carrying_shelf != None for agent in self.agents[:self.num_agvs]]
-
-    def get_shelf_request_information(self) -> np.ndarray[int]:
-        request_item_map = np.zeros(len(self.shelfs))
-        requested_shelf_ids = [shelf.id for shelf in self.request_queue]
-        for id_, coords in self.action_id_to_coords_map.items():
-            if (coords[1], coords[0]) not in self.goals:
-                if self.grid[CollisionLayers.SHELVES, coords[0], coords[1]] in requested_shelf_ids:
-                    request_item_map[id_ - len(self.goals) - 1] = 1
-        return request_item_map
-
-    def get_empty_shelf_information(self) -> np.ndarray[int]:
-        empty_item_map = np.zeros(len(self.shelfs))
-        for id_, coords in self.action_id_to_coords_map.items():
-            if (coords[1], coords[0]) not in self.goals:
-                if self.grid[CollisionLayers.SHELVES, coords[0], coords[1]] == 0 and (
-                    self.grid[CollisionLayers.CARRIED_SHELVES, coords[0], coords[1]] == 0
-                    or self.agents[
-                        self.grid[CollisionLayers.AGVS, coords[0], coords[1]] - 1
-                    ].req_action
-                    not in [Action.NOOP, Action.TOGGLE_LOAD]
-                ):
-                    empty_item_map[id_ - len(self.goals) - 1] = 1
-        return empty_item_map
-
-    def attribute_macro_actions(self, macro_actions: List[int]) -> Tuple[int, int]:
-        agvs_distance_travelled = 0
-        pickrs_distance_travelled = 0
-        # Logic for Macro Actions
-        for agent, macro_action in zip(self.agents, macro_actions):
-            # Initialize action for step
-            agent.req_action = Action.NOOP
-            # Collision avoidance logic
-            if agent.fixing_clash > 0:
-                agent.fixing_clash -= 1
-            if not agent.busy:
-                agent.target = 0
-                if macro_action != 0:
-                    agent.path = self.find_path((agent.y, agent.x), self.action_id_to_coords_map[macro_action], agent, care_for_agents=False)
-                    if agent.path:
-                        agent.busy = True
-                        agent.target = macro_action
-                        agent.req_action = get_next_micro_action(agent.x, agent.y, agent.dir, agent.path[0])
-                        self.stuck_counters[agent.id - 1].reset((agent.x, agent.y))
-            else:
-                # Check if agent finished the given path, if not continue the path
-                if agent.path == []:
-                    if agent.type in [AgentType.AGV, AgentType.AGENT]:
-                        agent.req_action = Action.TOGGLE_LOAD
-                    if agent.type == AgentType.PICKER:
-                        agent.busy = False
-                else:
-                    agent.req_action = get_next_micro_action(agent.x, agent.y, agent.dir, agent.path[0])
-                    agvs_distance_travelled += int(agent.type == AgentType.AGV)
-                    pickrs_distance_travelled += int(agent.type == AgentType.PICKER)
-                if len(agent.path) == 1:
-                    # If agent is at the end of a path and carrying a shelf and the target location is already occupied, restart agent
-                    if agent.carrying_shelf and self.grid[CollisionLayers.SHELVES, agent.path[-1][1], agent.path[-1][0]]:
-                        agent.req_action = Action.NOOP
-                        agent.busy = False
-                    # Logic for Pickers to load shelves if AGV is present at location or wait otherwise
-                    if agent.type == AgentType.PICKER:
-                        if (
-                            self.grid[CollisionLayers.AGVS, agent.path[-1][1], agent.path[-1][0]] == 0
-                            or self.agents[self.grid[CollisionLayers.AGVS, agent.path[-1][1], agent.path[-1][0]]- 1].req_action != Action.TOGGLE_LOAD
-                        ):
-                            agent.req_action = Action.NOOP
-                        elif (
-                            self.grid[CollisionLayers.AGVS, agent.path[-1][1], agent.path[-1][0]] != 0
-                            and self.agents[self.grid[CollisionLayers.AGVS, agent.path[-1][1], agent.path[-1][0]] - 1].req_action == Action.TOGGLE_LOAD
-                            ):
-                            self.stuck_counters[agent.id - 1].reset((agent.x, agent.y))
-        return agvs_distance_travelled, pickrs_distance_travelled
-
-    def resolve_move_conflict(self, agent_list):
-        commited_agents = set()
-        G = nx.DiGraph()
-        for agent in agent_list:
-            start = agent.x, agent.y
-            target = agent.req_location(self.grid_size)
-            G.add_edge(start, target)
-        wcomps = [G.subgraph(c).copy() for c in nx.weakly_connected_components(G)]
-        for comp in wcomps:
-            try:
-                # if we find a cycle in this component we have to
-                # commit all nodes in that cycle, and nothing else
-                cycle = nx.algorithms.find_cycle(comp)
-                if len(cycle) == 2:
-                    # we have a situation like this: [A] <-> [B]
-                    # which is physically impossible. so skip
-                    continue
-                for edge in cycle:
-                    start_node = edge[0]
-                    agent_id = self.grid[CollisionLayers.AGVS, start_node[1], start_node[0]]
-                    # action = self.agents[agent_id - 1].req_action
-                    # print(f"{agent_id}: C {cycle} {action}")
-                    if agent_id > 0:
-                        commited_agents.add(agent_id)
-                        continue
-                    picker_id = self.grid[CollisionLayers.PICKERS, start_node[1], start_node[0]]
-                    if picker_id > 0:
-                        commited_agents.add(picker_id)
-                        continue
-            except nx.NetworkXNoCycle:
-                longest_path = nx.algorithms.dag_longest_path(comp)
-                for x, y in longest_path:
-                    agent_id = self.grid[CollisionLayers.AGVS, y, x]
-                    if agent_id:
-                        commited_agents.add(agent_id)
-                        continue
-                    picker_id = self.grid[CollisionLayers.PICKERS, y, x]
-                    if picker_id:
-                        commited_agents.add(picker_id)
-        clashes = 0
-        for agent in agent_list:
-            for other in agent_list:
-                if agent.id != other.id:
-                    agent_new_x, agent_new_y = agent.req_location(self.grid_size)
-                    other_new_x, other_new_y = other.req_location(self.grid_size)
-                    # Clash fixing logic
-                    if agent.path and ((agent_new_x, agent_new_y) in [(other.x, other.y), (other_new_x, other_new_y)]):
-                        # If we are in a rack and one of the agents is a picker we ignore clashses, assumed behaviour is Picker is loading
-                        if not self._is_highway(agent_new_x, agent_new_y) and (agent.type == AgentType.PICKER or other.type == AgentType.PICKER) and agent.type != other.type:
-                            # Allow Pickers to step over AGVs (if no other Picker at that shelf location) or AGVs to step over Pickers (if no other AGV at that shelf location)
-                            if ((agent.type == AgentType.PICKER and self.grid[CollisionLayers.PICKERS, agent_new_y, agent_new_x] in [0, agent.id])
-                                or (agent.type == AgentType.AGV and self.grid[CollisionLayers.AGVS, agent_new_y, agent_new_x] in [0, agent.id])):
-                                commited_agents.add(agent.id)
-                                continue
-                        # If the agent's next action bumps it into another agent
-                        if (agent_new_x, agent_new_y) == (other.x, other.y):
-                            agent.req_action = Action.NOOP # Stop the action
-                            # Check if the clash is not solved naturaly by the other agent moving away
-                            if (other_new_x, other_new_y) in [(agent.x, agent.y), (agent_new_x, agent_new_y)] and not other.req_action in (Action.LEFT, Action.RIGHT):
-                                if other.fixing_clash == 0:# If the others are not already fixing the clash
-                                    clashes+=1
-                                    agent.fixing_clash = _FIXING_CLASH_TIME # Agent start time for clash fixing
-                                    new_path = self.find_path((agent.y, agent.x), (agent.path[-1][1] ,agent.path[-1][0]), agent)
-                                    if new_path != []: # If the agent can find an alternative path, assign it if not let the other solve the clash
-                                        agent.path = new_path
-                                    else:
-                                        agent.fixing_clash = 0
-                        elif (agent_new_x, agent_new_y) == (other_new_x, other_new_y) and (agent_new_x, agent_new_y) != (agent.x, agent.y):
-                            # If the agent's next action bumps it into another agent position after they take actions simultaneously
-                            if agent.fixing_clash == 0 and other.fixing_clash == 0:
-                                agent.req_action = Action.NOOP # If the agent's actions leads them in the position of another STOP
-                                agent.fixing_clash = _FIXING_CLASH_TIME  # Agent wait one step while the other moves into place
-
-        commited_agents = set([self.agents[id_ - 1] for id_ in commited_agents])
-        failed_agents = set(agent_list) - commited_agents
-        for agent in failed_agents:
-            agent.req_action = Action.NOOP
-        return clashes
-
-    def resolve_stuck_agents(self) -> None:
-        # This can happen when their goal is occupied after reaching their last step/re-calculating a path
-        overall_stucks = 0
-        moving_agents = [
-            agent
-            for agent in self.agents
-            if agent.busy
-            and agent.req_action not in (Action.LEFT, Action.RIGHT) # Don't count changing directions
-            and (agent.req_action!=Action.TOGGLE_LOAD or (agent.x, agent.y) in self.goals) # Don't count loading or changing directions / if at goal
-        ]
-        for agent in moving_agents:
-            agent_stuck_count = self.stuck_counters[agent.id - 1]
-            agent_stuck_count.update((agent.x, agent.y))
-            if _STUCK_THRESHOLD < agent_stuck_count.count < _STUCK_THRESHOLD + self.column_height + 2:  # Time to get out of aisle
-                agent.req_action = Action.NOOP
-                if agent.path:
-                    new_path = self.find_path((agent.y, agent.x), (agent.path[-1][1], agent.path[-1][0]), agent)
-                    # Picker should wait for AGV to arrive at destination regardless of stuck count
-                    if new_path:
-                        agent.path = new_path
-                        if len(agent.path) == 1:
-                            continue
-                        agent_stuck_count.reset((agent.x, agent.y))
-                        continue
-                else:
-                    overall_stucks += 1
-                    agent.busy = False
-                    agent_stuck_count.reset()
-            if agent_stuck_count.count > _STUCK_THRESHOLD + self.column_height + 2:  # Time to get out of aisle
-                overall_stucks += 1
-                agent_stuck_count.reset((agent.x, agent.y))
-                agent.req_action = Action.NOOP
-                agent.busy = False
-        return overall_stucks
-
-    def _execute_forward(self, agent: Agent) -> None:
-        agent.x, agent.y = agent.req_location(self.grid_size)
-        agent.path = agent.path[1:]
-        if agent.carrying_shelf:
-            agent.carrying_shelf.x, agent.carrying_shelf.y = agent.x, agent.y
-
-    def _execute_rotation(self, agent: Agent) -> None:
-        agent.dir = agent.req_direction()
-
-    def _execute_load(self, agent: Agent, rewards: np.ndarray[int]) -> np.ndarray[int]:
-        shelf_id = self.grid[CollisionLayers.SHELVES, agent.y, agent.x]
-        picker_id = self.grid[CollisionLayers.PICKERS, agent.y, agent.x]
-        if shelf_id:
-            if (
-                (agent.type == AgentType.AGV and picker_id)
-                or agent.type == AgentType.AGENT
-            ):
-                agent.carrying_shelf = self.shelfs[shelf_id - 1]
-                self.grid[CollisionLayers.SHELVES, agent.y, agent.x] = 0
-                self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = shelf_id
-                agent.busy = False
-                # Reward picker for loading
-                if self.reward_type == RewardType.GLOBAL:
-                    rewards += 0.5
-                elif self.reward_type == RewardType.INDIVIDUAL:
-                    if agent.type == AgentType.AGENT:
-                        rewards[agent.id - 1] += 0.1
-                    else:
-                        rewards[picker_id - 1] += 0.1
-        else:
-            agent.busy = False
-        return rewards
-
-    def _execute_unload(self, agent: Agent, rewards: np.ndarray[int]) -> np.ndarray[int]:
-        if (agent.x, agent.y) in self.goals or self.grid[CollisionLayers.SHELVES, agent.y, agent.x] != 0:
-            agent.busy = False
-            return rewards
-        picker_id = self.grid[CollisionLayers.PICKERS, agent.y, agent.x]
-        if not self._is_highway(agent.x, agent.y):
-            if (
-                (agent.type == AgentType.AGV and picker_id)
-                or agent.type == AgentType.AGENT
-            ):
-                self.grid[CollisionLayers.SHELVES, agent.y, agent.x] = agent.carrying_shelf.id
-                self.grid[CollisionLayers.CARRIED_SHELVES, agent.y, agent.x] = 0
-                agent.carrying_shelf = None
-                agent.busy = False
-                agent.has_delivered = False
-                # Reward picker for unloading
-                if self.reward_type == RewardType.GLOBAL:
-                    rewards += 0.5
-                elif self.reward_type == RewardType.INDIVIDUAL:
-                    if agent.type == AgentType.AGENT:
-                        rewards[agent.id - 1] += 0.1
-                    else:
-                        rewards[picker_id - 1] += 0.1
-        return rewards
-
-    def execute_micro_actions(self, rewards: np.ndarray[int]) -> np.ndarray[int]:
-        for agent in self.agents:
-            if agent.req_action == Action.FORWARD:
-                self._execute_forward(agent)
-            elif agent.req_action in [Action.LEFT, Action.RIGHT]:
-                self._execute_rotation(agent)
-            elif agent.req_action == Action.TOGGLE_LOAD:
-                if not agent.carrying_shelf:
-                    rewards = self._execute_load(agent, rewards)
-                else:
-                    rewards = self._execute_unload(agent, rewards)
-        return rewards
-
-    def process_shelf_deliveries(self, rewards: np.ndarray[int]) -> np.ndarray[int]:
-        shelf_deliveries = 0
-        for y, x in self.goals:
-            shelf_id = self.grid[CollisionLayers.CARRIED_SHELVES, x, y]
-            if not shelf_id  or self.shelfs[shelf_id - 1] not in self.request_queue:
-                continue
-            # Remove shelf from request queue and add replacement
-            carried_shels = [agent.carrying_shelf for agent in self.agents if agent.carrying_shelf]
-            new_shelf_candidates = list(set(self.shelfs) - set(self.request_queue) - set(carried_shels)) # sort so np.random with seed is repeatable
-            new_shelf_candidates.sort(key = lambda x: x.id)
-            new_request = np.random.choice(new_shelf_candidates)
-            self.request_queue[self.request_queue.index(self.shelfs[shelf_id - 1])] = new_request
-
-            agent = self.agents[self.grid[CollisionLayers.AGVS, x, y] - 1]
-            if not agent.has_delivered:
-                agent.has_delivered = True
-                if self.reward_type == RewardType.GLOBAL:
-                    rewards += 1
-                elif self.reward_type == RewardType.INDIVIDUAL:
-                    rewards[agent.id - 1] += 1
-            shelf_deliveries += 1
-
-        if shelf_deliveries:
-            self._cur_inactive_steps = 0
-        else:
-            self._cur_inactive_steps += 1
-
-        return rewards, shelf_deliveries
-
-    # Mod by Tim:
-    # def reset(self, seed=None, options=None)-> Tuple:
-    def reset(self, key: chex.PRNGKey) -> Tuple[State, TimeStep[Observation]]:
-        # Reset counters
-        Shelf.counter = 0
-        Agent.counter = 0
-        self._cur_inactive_steps = 0
-        self._cur_steps = 0
-
-        # Set seed
-        self.seed(seed)
-
-        # Make the shelfs
-        self.shelfs = [
-            Shelf(x, y)
-            for y, x in zip(
-                np.indices(self.grid_size)[0].reshape(-1),
-                np.indices(self.grid_size)[1].reshape(-1),
-            )
-            if not self._is_highway(x, y)
-        ]
-        self._higway_locs = np.array([(y, x) for y, x in zip(
-                np.indices(self.grid_size)[0].reshape(-1),
-                np.indices(self.grid_size)[1].reshape(-1),
-            ) if self._is_highway(x, y)])
-
-        # Spawn agents on higwahy locations
-        agent_loc_ids = np.random.choice(
-            np.arange(len(self._higway_locs)),
-            size=self.num_agents,
-            replace=False,
+        # collect first observations and create timestep
+        agents_view = self._make_observations(state.grid, state.agents, state.shelves)
+        observation = Observation(
+            agents_view=agents_view,
+            action_mask=state.action_mask,
+            step_count=state.step_count,
         )
-        agent_locs = [self._higway_locs[agent_loc_ids, 0], self._higway_locs[agent_loc_ids, 1]]
-        # and direction
-        agent_dirs = np.random.choice([d for d in Direction], size=self.num_agents)
-        self.agents = [
-            Agent(x, y, dir_, agent_type = agent_type)
-            for y, x, dir_, agent_type in zip(*agent_locs, agent_dirs, self._agent_types)
-        ]
+        timestep = restart(observation=observation)
+        return state, timestep
 
-        self.stuck_counters = [StuckCounter((agent.x, agent.y)) for agent in self.agents]
-        self._recalc_grid()
-
-        self.request_queue = list(
-            np.random.choice(self.shelfs, size=self.request_queue_size, replace=False)
-        )
-        self.observation_space_mapper.extract_environment_info(self)
-        return tuple([self.observation_space_mapper.observation(agent) for agent in self.agents])
-
-    # Mod by Tim:
-    # def step(self, macro_actions: List[int]) -> Tuple[List[np.ndarray], List[float], List[bool], List[bool], Dict]:
     def step(
         self,
         state: State,
-        macro_actions: chex.Array,
+        action: chex.Array,
     ) -> Tuple[State, TimeStep[Observation]]:
-        
-        # Attribute macro actions to agents and resolve conflicts
-        agvs_distance_travelled, pickers_distance_travelled = self.attribute_macro_actions(macro_actions)
-        clashes_count = self.resolve_move_conflict(self.agents)
-        # Restart agents if they are stuck at the same position
-        stucks_count = self.resolve_stuck_agents()
+        """Perform an environment step.
 
-        rewards = np.zeros(self.num_agents)
-        # Apply penalty for inactivity
-        rewards -= 0.001
-        # Execute micro actions
-        rewards = self.execute_micro_actions(rewards)
-        # Process shelf deliveries
-        rewards, shelf_deliveries = self.process_shelf_deliveries(rewards)
+        Args:
+            state: State object containing the dynamics of the environment.
+            action: Array containing the action to take.
+                - 0 no op
+                - 1 move forward
+                - 2 turn left
+                - 3 turn right
+                - 4 toggle load
 
-        self._recalc_grid()
-        self._cur_steps += 1
-        if (
-            self.max_inactivity_steps
-            and self._cur_inactive_steps >= self.max_inactivity_steps
-        ) or (self.max_steps and self._cur_steps >= self.max_steps):
-            terminateds = truncateds = self.num_agents * [True]
-        else:
-            terminateds = truncateds =  self.num_agents * [False]
+        Returns:
+            state: State object corresponding to the next state of the environment.
+            timestep: TimeStep object corresponding the timestep returned by the environment.
+        """
 
-        self.observation_space_mapper.extract_environment_info(self)
-        new_obs = tuple([self.observation_space_mapper.observation(agent) for agent in self.agents])
-        info = self._build_info(
-            agvs_distance_travelled,
-            pickers_distance_travelled,
-            clashes_count,
-            stucks_count,
-            shelf_deliveries,
+        # unpack state
+        key = state.key
+        grid = state.grid
+        agents = state.agents
+        shelves = state.shelves
+        request_queue = state.request_queue
+
+        # check for invalid action -> turn into noops
+        actions = utils.get_valid_actions(action, state.action_mask)
+
+        # update agents, shelves and grid
+        def update_state_scan(
+            carry_info: Tuple[chex.Array, chex.Array, chex.Array, int], action: int
+        ) -> Tuple[Tuple[chex.Array, chex.Array, chex.Array, int], None]:
+            grid, agents, shelves, agent_id = carry_info
+            grid, agents, shelves = self._update_state(grid, agents, shelves, action, agent_id)
+            return (grid, agents, shelves, agent_id + 1), None
+
+        (grid, agents, shelves, _), _ = jax.lax.scan(
+            update_state_scan, (grid, agents, shelves, 0), actions
         )
-        return new_obs, list(rewards), terminateds, terminateds, info
 
-    def _build_info(
+        # check for agent collisions
+        collisions = jax.vmap(functools.partial(utils.is_collision, grid))(agents, self.agent_ids)
+        collision = jnp.any(collisions)
+
+        # compute shared reward for all agents and update request queue
+        # if a requested shelf has been successfully delivered to the goal
+        reward = jnp.array(0, dtype=jnp.float32)
+
+        def update_reward_and_request_queue_scan(
+            carry_info: Tuple[chex.PRNGKey, chex.Array, chex.Array, chex.Array, chex.Array],
+            goal: chex.Array,
+        ) -> Tuple[Tuple[chex.PRNGKey, chex.Array, chex.Array, chex.Array, chex.Array], None]:
+            key, reward, request_queue, grid, shelves = carry_info
+            (
+                key,
+                reward,
+                request_queue,
+                shelves,
+            ) = self._update_reward_and_request_queue(
+                key, reward, request_queue, grid, shelves, goal
+            )
+            carry_info = (key, reward, request_queue, grid, shelves)
+            return carry_info, None
+
+        update_info, _ = jax.lax.scan(
+            update_reward_and_request_queue_scan,
+            (key, reward, request_queue, grid, shelves),
+            self.goals,
+        )
+        key, reward, request_queue, grid, shelves = update_info
+
+        # construct timestep and check environment termination
+        steps = state.step_count + 1
+        horizon_reached = steps >= self.time_limit
+        done = collision | horizon_reached
+
+        # compute next observation
+        agents_view = self._make_observations(grid, agents, shelves)
+        action_mask = utils.compute_action_mask(grid, agents)
+        next_observation = Observation(
+            agents_view=agents_view,
+            action_mask=action_mask,
+            step_count=steps,
+        )
+
+        timestep = jax.lax.cond(
+            done,
+            termination,
+            transition,
+            reward,
+            next_observation,
+        )
+        next_state = State(
+            grid=grid,
+            agents=agents,
+            shelves=shelves,
+            request_queue=request_queue,
+            step_count=steps,
+            action_mask=action_mask,
+            key=key,
+        )
+        return next_state, timestep
+
+    @cached_property
+    def observation_spec(self) -> specs.Spec[Observation]:
+        """Specification of the observation of the `RobotWarehouse` environment.
+        Returns:
+            Spec for the `Observation`, consisting of the fields:
+                - agents_view: Array (int32) of shape (num_agents, num_obs_features).
+                - action_mask: BoundedArray (bool) of shape (num_agent, 5).
+                - step_count: BoundedArray (int32) of shape ().
+        """
+        agents_view = specs.Array(
+            (self.num_agents, self.num_obs_features), jnp.int32, "agents_view"
+        )
+        action_mask = specs.BoundedArray((self.num_agents, 5), bool, False, True, "action_mask")
+        step_count = specs.BoundedArray((), jnp.int32, 0, self.time_limit, "step_count")
+        return specs.Spec(
+            Observation,
+            "ObservationSpec",
+            agents_view=agents_view,
+            action_mask=action_mask,
+            step_count=step_count,
+        )
+
+    @cached_property
+    def action_spec(self) -> specs.MultiDiscreteArray:
+        """Returns the action spec. 5 actions:
+        [0,1,2,3,4] -> [No Op, Forward, Left, Right, Toggle_load].
+
+        Since this is a multi-agent environment, the environment expects an array of actions.
+        This array is of shape (num_agents,).
+        """
+        return specs.MultiDiscreteArray(
+            num_values=jnp.array([len(Action)] * self.num_agents, jnp.int32),
+            name="action",
+        )
+
+    def _make_observations(
         self,
-        agvs_distance_travelled: int,
-        pickers_distance_travelled: int,
-        clashes_count: int,
-        stucks_count:  int,
-        shelf_deliveries: int,
-    ) -> Dict[str, np.ndarray]:
-        info = {}
-        agvs_idle_time = sum([int(agent.req_action in (Action.NOOP, Action.TOGGLE_LOAD)) for agent in self.agents[:self.num_agvs]])
-        pickers_idle_time = sum([int(agent.req_action in (Action.NOOP, Action.TOGGLE_LOAD)) for agent in self.agents[self.num_agvs:]])
-        info["vehicles_busy"] = [agent.busy for agent in self.agents]
-        info["shelf_deliveries"] = shelf_deliveries
-        info["clashes"] = clashes_count
-        info["stucks"] = stucks_count
-        info["agvs_distance_travelled"] = agvs_distance_travelled
-        info["pickers_distance_travelled"] = pickers_distance_travelled
-        info["agvs_idle_time"] = agvs_idle_time
-        info["pickers_idle_time"] = pickers_idle_time
-        return info
+        grid: chex.Array,
+        agents: Agent,
+        shelves: Shelf,
+    ) -> chex.Array:
+        """Create an observation for each agent based on its view of other
+        agents and shelves
 
-    def compute_valid_action_masks(self, pickers_to_agvs=True, block_conflicting_actions=True):
-        requested_items = self.get_shelf_request_information()
-        empty_items = self.get_empty_shelf_information()
-        carrying_shelf_info = self.get_carrying_shelf_information()
-        targets_agvs = [target - len(self.goals) - 1 for target in self.targets_agvs if target > len(self.goals)]
-        targets_pickers = [target - len(self.goals) - 1 for target in self.targets_pickers if target > len(self.goals)]
-        # Compute valid location list for AGVs
-        valid_location_list_agvs = np.array([
-            empty_items if carrying_shelf else requested_items for carrying_shelf in carrying_shelf_info
-        ])
-        # Compute valid location list for Pickers
-        if pickers_to_agvs:
-            valid_location_list_pickers = np.zeros(len(self.action_id_to_coords_map) - len(self.goals))
-            valid_location_list_pickers[targets_agvs] = 1
-        else:
-            valid_location_list_pickers = requested_items
-        # Mask out conflicting actions for agents of the same type
-        if block_conflicting_actions:
-            valid_location_list_agvs[:, targets_agvs] = 0
-            valid_location_list_pickers[targets_pickers] = 0
-        valid_action_masks = np.ones((self.num_agents, self.action_size))
-        valid_action_masks[:self.num_agvs,  1 + len(self.goals):] = valid_location_list_agvs
-        valid_action_masks[:self.num_agvs,  1 : 1 + len(self.goals)] = np.repeat(np.expand_dims(np.array(carrying_shelf_info), 1), len(self.goals), axis=1)
-        valid_action_masks[self.num_agvs:,  1 + len(self.goals):] = valid_location_list_pickers
-        valid_action_masks[self.num_agvs:,  1 : 1 + len(self.goals)] = 0
-        return valid_action_masks
+        Args:
+            grid: the warehouse floor grid array.
+            agents: a pytree of Agent type containing agents information.
+            shelves: a pytree of Shelf type containing shelves information.
 
-    def render(self, mode="human"):
-        if not self.renderer:
-            from tarware.rendering import Viewer
-            self.renderer = Viewer(self.grid_size)
-        return self.renderer.render(self, return_rgb_array=mode == "rgb_array")
+        Returns:
+            an array containing agents observations.
+        """
+        return jax.vmap(
+            functools.partial(
+                utils.make_agent_observation,
+                grid,
+                agents,
+                shelves,
+                self.sensor_range,
+                self.num_obs_features,
+                self.highways,
+            )
+        )(self.agent_ids)
 
-    def close(self):
-        if self.renderer:
-            self.renderer.close()
+    def _update_state(
+        self,
+        grid: chex.Array,
+        agents: chex.Array,
+        shelves: chex.Array,
+        action: int,
+        agent_id: int,
+    ) -> Tuple[chex.Array, chex.Array, chex.Array]:
+        """Update the state of the environment after an action is performed.
 
-    def seed(self, seed=None):
-        np.random.seed(seed)
-        random.seed(seed)
+        Args:
+            grid: the warehouse floor grid array.
+            agents: a pytree of Agent type containing agents information.
+            shelves: a pytree of Shelf type containing shelves information.
+            action: the action performed by the agent.
+            agent_id: the id of the agent performing the action.
+        Returns:
+            the updated warehouse floor grid array, agents and shelves.
+        """
+        agent = tree_slice(agents, agent_id)
+        is_highway = self.highways[agent.position.x, agent.position.y]
+        grid, agents, shelves = jax.lax.cond(
+            jnp.equal(action, Action.FORWARD.value),
+            set_new_position_after_forward,
+            set_new_direction_after_turn,
+            grid,
+            agents,
+            shelves,
+            action,
+            agent_id,
+            is_highway,
+        )
+
+        return grid, agents, shelves
+
+    def _update_reward_and_request_queue(
+        self,
+        key: chex.PRNGKey,
+        reward: chex.Array,
+        request_queue: chex.Array,
+        grid: chex.Array,
+        shelves: chex.Array,
+        goal: chex.Array,
+    ) -> Tuple[chex.PRNGKey, int, chex.Array, chex.Array]:
+        """Check if a shelf has been delivered successfully to a goal state,
+        if so reward the agents and update the request queue: removing the ID
+        of the delivered shelf and replacing it with a new shelf ID.
+
+        Args:
+            key: a pseudorandom number generator key.
+            reward: the array of shared reward for each agent.
+            request_queue: the queue of requested shelves.
+            grid: the warehouse floor grid array.
+            shelves: a pytree of Shelf type containing shelves information.
+            goal: array of goal positions.
+        Returns:
+            a random key, updated reward, request queue and shelves.
+        """
+        y, x = goal
+        shelf_id = grid[_SHELVES, x, y]
+
+        def reward_and_update_request_queue_if_shelf_in_goal(
+            key: chex.PRNGKey,
+            reward: jnp.int32,
+            request_queue: chex.Array,
+            shelves: chex.Array,
+            shelf_id: int,
+        ) -> Tuple[chex.PRNGKey, int, chex.Array, chex.Array]:
+            "Reward the agents and update the request queue."
+
+            # remove from queue and replace it
+            key, request_key = jax.random.split(key)
+
+            not_in_queue = jnp.setdiff1d(
+                self.shelf_ids,
+                request_queue,
+                size=self.not_in_queue_size,
+            )
+            new_request_id = jax.random.choice(
+                request_key,
+                not_in_queue,
+                replace=False,
+            )
+            replace_index = jnp.argwhere(jnp.equal(request_queue, shelf_id - 1), size=1)
+            request_queue = request_queue.at[replace_index].set(new_request_id)
+
+            # also reward the agents
+            reward += 1.0
+
+            # update requested shelf
+            shelves = update_shelf(shelves, shelf_id - 1, "is_requested", 0)
+            shelves = update_shelf(shelves, new_request_id, "is_requested", 1)
+            return key, reward, request_queue, shelves
+
+        # check if shelf is at goal position and in request queue
+        shelf_at_goal = (~jnp.equal(shelf_id, 0)) & jnp.isin(shelf_id, request_queue + 1)
+
+        key, reward, request_queue, shelves = jax.lax.cond(
+            shelf_at_goal,
+            reward_and_update_request_queue_if_shelf_in_goal,
+            lambda k, r, rq, g, _: (k, r, rq, g),
+            key,
+            reward,
+            request_queue,
+            shelves,
+            shelf_id,
+        )
+        return key, reward, request_queue, shelves
+
+    def render(self, state: State) -> Optional[NDArray]:
+        """Renders the current state of the RobotWarehouse environment.
+
+        Args:
+            state: is the current environment state to be rendered.
+            save_path: the path where the image should be saved. If it is None, the plot
+            will not be stored.
+        """
+        return self._viewer.render(state)
+
+    def animate(
+        self,
+        states: Sequence[State],
+        interval: int = 200,
+        save_path: Optional[str] = None,
+    ) -> matplotlib.animation.FuncAnimation:
+        """Creates an animation from a sequence of RobotWarehouse states.
+
+        Args:
+            states: sequence of `State` corresponding to subsequent timesteps.
+            interval: delay between frames in milliseconds, default to 200.
+            save_path: the path where the animation file should be saved. If it is None,
+                the plot will not be saved.
+
+        Returns:
+            Animation object that can be saved as a GIF, MP4, or rendered with HTML.
+        """
+        return self._viewer.animate(states=states, interval=interval, save_path=save_path)
+
+    def close(self) -> None:
+        """Perform any necessary cleanup.
+
+        Environments will automatically :meth:`close()` themselves when
+        garbage collected or when the program exits.
+        """
+        self._viewer.close()

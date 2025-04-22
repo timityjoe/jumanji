@@ -47,6 +47,7 @@ from jumanji.environments import (
     Sokoban,
     Sudoku,
     Tetris,
+    TaskAwareRobotWarehouse,
 )
 from jumanji.training import networks
 from jumanji.training.agents.a2c import A2CAgent
