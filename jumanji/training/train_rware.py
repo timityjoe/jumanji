@@ -36,38 +36,6 @@ from jumanji.training.timer import Timer
 from jumanji.training.types import TrainingState
 
 import os
-import requests
-
-import warnings
-warnings.filterwarnings("ignore")
-
-from jumanji.training.train import train
-from hydra import compose, initialize
-
-# @title Set up JAX for available hardware (run me) { display-mode: "form" }
-
-import subprocess
-import os
-
-
-def download_file(url: str, file_path: str) -> None:
-    # Send an HTTP GET request to the URL
-    response = requests.get(url)
-    # Check if the request was successful (status code 200)
-    if response.status_code == 200:
-        with open(file_path, "wb") as f:
-            f.write(response.content)
-    else:
-        print("Failed to download the file.")
-
-# env = "multi_cvrp"  # @param ['bin_pack', 'cleaner', 'connector', 'cvrp', 'game_2048', 'graph_coloring', 'job_shop', 'knapsack', 'maze', 'minesweeper', 'mmst', 'multi_cvrp', 'robot_warehouse', 'rubiks_cube', 'snake', 'sudoku', 'tetris', 'tsp']
-env = "robot_warehouse"
-# env = "maze"
-# env = "cleaner"
-
-agent = "random"  # @param ['random', 'a2c']
-# agent = "a2c"
-
 
 # Mod by Tim: @ $JUMANJI_DIR/jumanji/training/configs/
 # @hydra.main(config_path="configs", config_name="config.yaml")
@@ -93,9 +61,7 @@ def train(cfg: omegaconf.DictConfig, log_compiles: bool = False) -> None:
     print(f"num_steps_per_epoch:{num_steps_per_epoch}")
 
     eval_timer = Timer(out_var_name="metrics")
-    train_timer = Timer(
-        out_var_name="metrics", num_steps_per_timing=num_steps_per_epoch
-    )
+    train_timer = Timer(out_var_name="metrics", num_steps_per_timing=num_steps_per_epoch)
 
     @functools.partial(jax.pmap, axis_name="devices")
     def epoch_fn(training_state: TrainingState) -> Tuple[TrainingState, Dict]:
@@ -169,16 +135,4 @@ if __name__ == "__main__":
         else:
             print("Only CPU accelerator is connected.")
 
-
-    os.makedirs("configs", exist_ok=True)
-    config_url = "https://raw.githubusercontent.com/instadeepai/jumanji/main/jumanji/training/configs/config.yaml"
-    download_file(config_url, "configs/config.yaml")
-    env_url = f"https://raw.githubusercontent.com/instadeepai/jumanji/main/jumanji/training/configs/env/{env}.yaml"
-    os.makedirs("configs/env", exist_ok=True)
-    download_file(env_url, f"configs/env/{env}.yaml")
-
-
-    with initialize(version_base=None, config_path="configs"):
-        cfg = compose(config_name="config.yaml", overrides=[f"env={env}", f"agent={agent}", "logger.type=terminal", "logger.save_checkpoint=true"])
-
-    train(cfg)
+    train()

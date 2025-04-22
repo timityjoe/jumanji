@@ -140,13 +140,16 @@ conda create -n conda311-jumanji python=3.11
 conda activate conda311-jumanji
 pip install jax==0.5.3 jaxlib==0.5.3
 
-uv pip install -r requirements/requirements.txt
-uv pip install -r requirements/requirements-dev.txt
-uv pip install -r requirements/requirements-train.txt
+pip install -r requirements/requirements.txt
+pip install -r requirements/requirements-dev.txt
+pip install -r requirements/requirements-train.txt
 
-uv pip install tensorflow (for Tensorboard display)
-uv pip install hydra-core
-uv pip install dm-haiku
+pip install tensorflow (for Tensorboard display)
+
+# For TA-RWARE
+pip install networkx
+pip install networkx
+pip install pyastar2d
 # uv pip install -e .
 
 
@@ -171,7 +174,7 @@ Relevant directories:
 
 python3 -m jumanji.training.train
 python3 -m jumanji.training.train_rware
-python3 -m jumanji.training.train_rware_a2c
+python3 -m jumanji.training.train_tarware
 python3 -m jumanji.training.load_checkpoint
 ```
 
