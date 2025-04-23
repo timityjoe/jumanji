@@ -148,8 +148,8 @@ pip install tensorflow (for Tensorboard display)
 
 # For TA-RWARE
 pip install networkx
-pip install networkx
 pip install pyastar2d
+pip install protobuf==3.20.1
 # uv pip install -e .
 
 
@@ -298,6 +298,12 @@ If you use Jumanji in your work, please cite the library using:
     primaryClass={cs.LG}
 }
 ```
+
+## Adding New Environments
+jumanji/__init__.py                            - L146
+jumanji/environments/__init__.py               - L51
+jumanji/training/setup_train.py                - L50, L345
+jumanji/training/configs/env/{NEW_ENV}.yaml
 
 ## See Also 🔎
 

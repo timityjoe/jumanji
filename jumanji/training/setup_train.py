@@ -341,6 +341,16 @@ def _setup_actor_critic_neworks(cfg: DictConfig, env: Environment) -> ActorCriti
             transformer_key_size=cfg.env.network.transformer_key_size,
             transformer_mlp_units=cfg.env.network.transformer_mlp_units,
         )
+    # Mod by Tim: Added tarware    
+    elif cfg.env.name == "TaskAwareRobotWarehouse":
+        assert isinstance(env.unwrapped, TaskAwareRobotWarehouse)
+        actor_critic_networks = networks.make_actor_critic_networks_robot_warehouse(
+            robot_warehouse=env.unwrapped,
+            transformer_num_blocks=cfg.env.network.transformer_num_blocks,
+            transformer_num_heads=cfg.env.network.transformer_num_heads,
+            transformer_key_size=cfg.env.network.transformer_key_size,
+            transformer_mlp_units=cfg.env.network.transformer_mlp_units,
+        )
     elif cfg.env.name == "minesweeper":
         assert isinstance(env.unwrapped, Minesweeper)
         actor_critic_networks = networks.make_actor_critic_networks_minesweeper(

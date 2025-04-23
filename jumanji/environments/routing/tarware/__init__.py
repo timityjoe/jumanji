@@ -3,9 +3,9 @@ import itertools
 import gymnasium as gym
 
 from jumanji.environments.routing.tarware.spaces import observation_map
-# from jumanji.environments.routing.tarware.warehouse import RewardType
+from jumanji.environments.routing.tarware.warehouse import RewardType
 
-from jumanji.environments.routing.tarware.env import TaskAwareRobotWarehouse, RewardType
+from jumanji.environments.routing.tarware.env import TaskAwareRobotWarehouse
 
 _obs_types = list(observation_map.keys())
 

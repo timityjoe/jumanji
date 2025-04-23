@@ -1,5 +1,5 @@
 # Edit [registered_version] @ $JUMANJI_DIR/jumanji/__init__.py
-name: tarware
+name: TaskAwareRobotWarehouse
 registered_version: TaskAwareRobotWarehouse-v0
 
 network:

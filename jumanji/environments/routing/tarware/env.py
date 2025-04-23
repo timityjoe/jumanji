@@ -26,29 +26,29 @@ from jumanji import specs
 from jumanji.env import Environment
 from jumanji.environments.routing.tarware import utils
 
-# from jumanji.environments.routing.tarware.warehouse import _SHELVES
+from jumanji.environments.routing.tarware.constants import _SHELVES
 
-# from jumanji.environments.routing.tarware.generator import (
-#     Generator,
-#     RandomGenerator,
-# )
-# from jumanji.environments.routing.tarware.types import (
-#     Action,
-#     Agent,
-#     Direction,
-#     Observation,
-#     Shelf,
-#     State,
-# )
-# from jumanji.environments.routing.tarware.utils_agent import (
-#     set_new_direction_after_turn,
-#     set_new_position_after_forward,
-# )
-# from jumanji.environments.routing.tarware.utils_shelf import update_shelf
-# from jumanji.environments.routing.tarware.viewer import RobotWarehouseViewer
-# from jumanji.tree_utils import tree_slice
-# from jumanji.types import TimeStep, restart, termination, transition
-# from jumanji.viewer import Viewer
+from jumanji.environments.routing.tarware.generator import (
+    Generator,
+    RandomGenerator,
+)
+from jumanji.environments.routing.tarware.types import (
+    Action,
+    Agent,
+    Direction,
+    Observation,
+    Shelf,
+    State,
+)
+from jumanji.environments.routing.tarware.utils_agent import (
+    set_new_direction_after_turn,
+    set_new_position_after_forward,
+)
+from jumanji.environments.routing.tarware.utils_shelf import update_shelf
+from jumanji.environments.routing.tarware.viewer import RobotWarehouseViewer
+from jumanji.tree_utils import tree_slice
+from jumanji.types import TimeStep, restart, termination, transition
+from jumanji.viewer import Viewer
 
 
 class TaskAwareRobotWarehouse(Environment[State, specs.MultiDiscreteArray, Observation]):

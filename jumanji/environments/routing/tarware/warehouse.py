@@ -9,7 +9,7 @@ from gymnasium import spaces
 from jumanji.environments.routing.tarware.definitions import (Action, AgentType, Direction,
                                  RewardType, CollisionLayers)
 from jumanji.environments.routing.tarware.spaces import observation_map
-from jumanji.environments.routing.tarware.utils import find_sections, get_next_micro_action
+from jumanji.environments.routing.tarware.utils_dir import find_sections, get_next_micro_action
 
 _FIXING_CLASH_TIME = 4
 _STUCK_THRESHOLD = 5
